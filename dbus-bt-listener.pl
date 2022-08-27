@@ -5,21 +5,58 @@ use warnings;
 use Net::DBus qw(:typing);
 use Net::DBus::Reactor;
 
-use Data::Dumper;
+################################################################################
+# configuration
 
-my $bus = Net::DBus->system;
-my $service = $bus->get_service("org.bluez");
+use constant {
+    LOG_DATA_INTERVAL => 30,
+};
+
+    
+################################################################################
+# logging
+
+sub log_with_timestamp {
+    my ($sec,$min,$hour,$mday,$mon,$year) = localtime(time);
+    printf "%04d-%02d-%02d %02d:%02d:%02d | %s\n",
+	$year+1900, $mon, $mday, $hour, $min, $sec,
+	join(' ', @_);
+}
+
+sub log_info {
+    # comment this to disable log level INFO (normal output)
+    log_with_timestamp @_;
+}
+
+sub log_other {
+    # comment this to disable log level OTHER (ignored BT devices)
+    #log_with_timestamp @_;
+}
+
+sub log_debug {
+    # comment this to disable log level DEBUG (debug output)
+#    log_with_timestamp @_;
+}
+
+sub log_dumper {
+    # comment this to disable log level DUMP (use Data::Dumper on all arguments)
+#    use Data::Dumper;
+#    log_with_timestamp Dumper(@_);
+}
 
 ################################################################################
 # DBus helpers
 
+my $bus = Net::DBus->system;
+my $service = $bus->get_service("org.bluez");
+
 sub register_signal {
     my ($dbus_object, $signal_name, $coderef) = @_;
     my $signal_id = $dbus_object->connect_to_signal($signal_name, $coderef);
-    print "  registered signal $signal_name#$signal_id\n";
+    log_info "  registered signal $signal_name#$signal_id";
     return sub {
 	$dbus_object->disconnect_from_signal($signal_name, $signal_id);
-	print "  unregistered signal $signal_name#$signal_id\n";
+	log_info "  unregistered signal $signal_name#$signal_id";
     }
 }
 
@@ -34,19 +71,13 @@ sub unregister_signals {
 # FIXME: stupid name
 my %known_sensors;
 
-sub print_row {
-    my (@data) = @_;
-    @data = map { sprintf "%-48s", $_ } @data;
-    print join('  |  ', @data) . "\n";
-}
-
 sub format_sensor_data {
     my ($sensor_data) = @_;
 
     my @values;
 
     my $tc = $sensor_data->{TEMPERATURE_CELSIUS};
-    push @values, sprintf("T:%5.2fC", $tc) if defined $tc;
+    push @values, sprintf("T:%5.2f°C", $tc) if defined $tc;
 
     my $hp = $sensor_data->{HUMIDITY_PERCENT};
     push @values, sprintf("H:%5.2f%%", $hp) if defined $hp;
@@ -55,7 +86,7 @@ sub format_sensor_data {
     push @values, sprintf("B:%4dmV", $bm) if defined $bm;
     
     my $bp = $sensor_data->{BATTERY_PERCENT};
-    push @values, sprintf("B:%2d%%", $bp) if defined $bp;
+    push @values, sprintf("B:%3d%%", $bp) if defined $bp;
     
     my $rd = $sensor_data->{RSSI_DBM};
     push @values, sprintf("S:%+2ddB/m", $rd) if defined $rd;
@@ -65,12 +96,12 @@ sub format_sensor_data {
 
 my $print_count = 0;
 sub show_sensor_data {
-    if (++$print_count > 30) {
-	print "\n" . localtime(time()) . "\n";
-	print_row map { (split m:/:, $_)[-1]  } sort keys %known_sensors;
+    if (++$print_count > LOG_DATA_INTERVAL) {
+	foreach my $sensor_path (sort keys %known_sensors) {
+	    my $sensor = $known_sensors{$sensor_path};
+	    log_info $sensor_path, format_sensor_data($sensor);
+	}
 	$print_count = 0;
-	print_row map { format_sensor_data($known_sensors{$_}) } sort keys %known_sensors;
-	print "\n";
     }
 }
 
@@ -82,6 +113,7 @@ use constant PARSERS => {
     '0000181a-0000-1000-8000-00805f9b34fb' => \&parse_YMCA_with_ATC_firmare_type_x
 };
 
+# FIXME: fix method name ;-)
 # https://github.com/pvvx/ATC_MiThermometer
 sub parse_YMCA_with_ATC_firmare_type_x {
     my ($service_data) = @_;
@@ -129,13 +161,12 @@ sub device_added {
 
     my $name = get_device_name($properties);
     if (!is_device_a_supported_sensor($properties)) {
-	print "\nignoring added Device $name at $path\n";
+	log_other "ignoring added Device $name at $path";
 	return;
     }
     
-    print "\nfound Device $name at $path:\n";
-    # print Dumper($properties);
-    # print "  supported interfaces: " . join(', ', @interface_names) . "\n";
+    log_info "found Device $name at $path:";
+    log_dumper $properties;
 
     record_device_data($path, $properties);
     
@@ -160,13 +191,13 @@ sub device_removed {
     my $device = $known_devices{$path};
 
     unless (defined $device) {
-	print "\nignoring removed Device at $path\n";
+	log_other "ignoring removed Device at $path";
 	return;
     }
 
     my $name = $device->{NAME};
     
-    print "\nremoved Device $name at $path:\n";
+    log_info "removed Device $name at $path:";
 
     # FIXME: allow calling with Array AND ArrayRef
     unregister_signals(@{$device->{SIGNALS}});
@@ -220,13 +251,12 @@ use constant BLUEZ_ADAPTER => 'org.bluez.Adapter1';
 sub adapter_added {
     my ($path) = @_;
     
-    print "\nfound Adapter $path:\n";
-    # print Dumper($properties);
+    log_info "found Adapter $path:";
     
     my $object = $service->get_object($path);
     my $properties = $object->as_interface('org.freedesktop.DBus.Properties');
     $properties->Set(BLUEZ_ADAPTER, 'Powered', dbus_boolean(1));
-    print "  set to power\n";
+    log_info "  set to power";
 
     # start BLE discovery
     my $adapter = $object->as_interface(BLUEZ_ADAPTER);
@@ -237,13 +267,13 @@ sub adapter_added {
 
     # FIXME: catch discovery already in progress
     $adapter->StartDiscovery;
-    print "  discovery started\n";
+    log_info "  discovery started";
 }
 
 sub adapter_removed {
     my ($path) = @_;
     
-    print "\nremoved Adapter $path\n";
+    log_info "removed Adapter $path";
 }
 
 
@@ -280,7 +310,7 @@ sub interfaces_removed {
 ################################################################################
 # main routine
 
-print "register signals for interface changes:\n";
+log_info "register signals for interface changes:";
 my $object_manager = $service->get_object("/");
 my @global_signals;
 push @global_signals, register_signal($object_manager, 'InterfacesAdded', \&interfaces_added);
@@ -293,13 +323,12 @@ while (my ($path, $interfaces) = each %{$managed_objects}) {
     interfaces_added($path, $interfaces);
 }
 
-print "\n\n";
 show_sensor_data();
 
 # RUN IT IN THE MAIN LOOP
 Net::DBus::Reactor->main->run;
 
 # FIXME: how can we get here to clean up?
-print "unregister all signals:\n";
+log_info "unregister all signals:";
 unregister_signals(@{$known_devices{$_}->{SIGNALS}}) foreach keys %known_devices;
 unregister_signals(@global_signals);
