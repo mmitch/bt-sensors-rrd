@@ -1,0 +1,7 @@
+# VS Code files (perl-lang language server for Emacs Eglot uses this)
+.vscode/
+
+# backup files
+*~
+.#*
+*#
