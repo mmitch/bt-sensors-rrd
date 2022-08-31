@@ -110,20 +110,20 @@ sub show_sensor_data {
 # parse sensor data
 
 use constant PARSERS => {
-    '0000181a-0000-1000-8000-00805f9b34fb' => \&parse_YMCA_with_ATC_firmare_type_x
+    '0000181a-0000-1000-8000-00805f9b34fb' => \&parse_LYWSD03MMC_with_ATC_MiThermometer
 };
 
-# FIXME: fix method name ;-)
-# https://github.com/pvvx/ATC_MiThermometer
-sub parse_YMCA_with_ATC_firmare_type_x {
+# https://github.com/atc1441/ATC_MiThermometer#advertising-format-of-the-custom-firmware
+sub parse_LYWSD03MMC_with_ATC_MiThermometer {
     my ($service_data) = @_;
     my (@raw) = @{$service_data};
 
     return {
-	TEMPERATURE_CELSIUS => ($raw[7] * 256 + $raw[8]) / 100,
-	HUMIDITY_PERCENT    => ($raw[9] * 256 + $raw[10]) / 100,
+	TEMPERATURE_CELSIUS => ($raw[7] * 256 + $raw[8])  / 100,
+	HUMIDITY_PERCENT    => $raw[9] * 2.56,
+	BATTERY_PERCENT     => $raw[10],
 	BATTERY_MILLIVOLT   => $raw[11] * 256 + $raw[12],
-	BATTERY_PERCENT     => $raw[13],
+	FRAME_COUNTER       => $raw[13],
     }
 }
     
