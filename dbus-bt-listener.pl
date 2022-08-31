@@ -4,12 +4,14 @@ use warnings;
 
 use Net::DBus qw(:typing);
 use Net::DBus::Reactor;
+use RRDs;
 
 ################################################################################
 # configuration
 
 use constant {
     LOG_DATA_INTERVAL => 30,
+    RRD_PATH => '~/rrd/',
 };
 
     
@@ -30,7 +32,7 @@ sub log_info {
 
 sub log_other {
     # comment this to disable log level OTHER (ignored BT devices)
-    #log_with_timestamp @_;
+#    log_with_timestamp @_;
 }
 
 sub log_debug {
@@ -43,6 +45,7 @@ sub log_dumper {
 #    use Data::Dumper;
 #    log_with_timestamp Dumper(@_);
 }
+
 
 ################################################################################
 # DBus helpers
@@ -62,6 +65,98 @@ sub register_signal {
 
 sub unregister_signals {
     $_->() foreach reverse @_;
+}
+
+
+################################################################################
+# store data in RRDs
+
+use constant RRD_DSS_CONFIG => [
+    # this is no hashref, as order is important for RRDs::update!
+    {
+	NAME => 'temp_c',
+	# LYWSD03MMC can do -9.9°C to 60°C, but give some leeway for other sensors
+	MIN => -5000,
+	MAX => 10000,
+    },
+    {
+	NAME => 'hum_pc',
+	MIN => 0,
+	MAX => 100,
+    },
+    {
+	NAME => 'batt_mv',
+	MIN => 0,
+	MAX => 5000,
+    },
+    {
+	NAME => 'batt_pc',
+	MIN => 0,
+	MAX => 100,
+    },
+    {
+	NAME => 'rssi',
+	MIN => -256,
+	MAX => 0,
+    },
+    ];
+
+use constant {
+    RRD_HEARTBEAT => 300,
+    RRD_XFF => 0.5,
+    RRD_CFS => ['AVERAGE', 'MIN', 'MAX'],
+    RRD_STEPS_ROWS => ['1m:1d', '15m:2w', '1h:13M', '1d:20y'],
+};
+
+sub create_rrd {
+    my ($rrd_file) = @_;
+
+    my @dss = ();
+    foreach my $dss (@{RRD_DSS_CONFIG()}) {
+	push @dss,
+	    sprintf "DS:%s:GAUGE:%d:%d:%d",
+	    $dss->{NAME}, RRD_HEARTBEAT, $dss->{MIN}, $dss->{MAX};
+    }
+
+    my @rras = ();
+    foreach my $cf (@{RRD_CFS()}) {
+	foreach my $steps_rows (@{RRD_STEPS_ROWS()}) {
+	    push @rras,
+		sprintf "RRA:%s:%s:%s",
+		$cf, RRD_XFF, $steps_rows;
+	}
+    }
+
+    my $step = 60;
+    my @cmdline = ($rrd_file, '-s', $step, @dss, @rras);
+    log_debug "RRDs::create(", @cmdline, ")";
+    RRDs::create(@cmdline);
+    log_info "created missing RRD file $rrd_file";
+}
+
+# RSSID and sensor data change at different times
+# RSSID might be outdated, but this should not matter too much
+# I don't want to handle two different RRDs because of this
+# TODO: change this?  keep this?
+sub store_in_rrd {
+    my ($sensor) = @_;
+
+    my $rrd_file = sprintf "%s/bt-sensors-%s.rrd", RRD_PATH, $sensor->{NAME};
+    $rrd_file =~ s://+:/:g;
+    $rrd_file =~ s:^~:$ENV{HOME}:e;
+
+    create_rrd $rrd_file unless -e $rrd_file;
+
+    my @values = map { $_ // 'U' } (
+	$sensor->{TEMPERATURE_CELSIUS},
+	$sensor->{HUMIDITY_PERCENT},
+	$sensor->{BATTERY_MILLIVOLT},
+	$sensor->{BATTERY_PERCENT},
+	$sensor->{RSSI_DBM}
+    );
+    my @cmdline = ($rrd_file, join(':', ('N', @values)));
+    log_debug "write to rrd", $rrd_file, @cmdline;
+    RRDs::update(@cmdline);
 }
 
 
@@ -97,9 +192,8 @@ sub format_sensor_data {
 my $print_count = 0;
 sub show_sensor_data {
     if (++$print_count > LOG_DATA_INTERVAL) {
-	foreach my $sensor_path (sort keys %known_sensors) {
-	    my $sensor = $known_sensors{$sensor_path};
-	    log_info $sensor_path, format_sensor_data($sensor);
+	foreach my $sensor (map { $known_sensors{$_} } sort keys %known_sensors) {
+	    log_info $sensor->{NAME}, format_sensor_data($sensor);
 	}
 	$print_count = 0;
     }
@@ -168,13 +262,14 @@ sub device_added {
     log_info "found Device $name at $path:";
     log_dumper $properties;
 
+    $known_sensors{$path}->{NAME} = $name;
+    $known_devices{$path}->{NAME} = $name;
+
     record_device_data($path, $properties);
     
     my $object = $service->get_object($path);
     my $properties_if = $object->as_interface('org.freedesktop.DBus.Properties');
 
-    $known_devices{$path}->{NAME} = $name;
-    
     push @{$known_devices{$path}->{SIGNALS}},
 	register_signal(
 	    $properties_if,
@@ -212,6 +307,13 @@ sub record_device_data {
 
     my $has_changed = 0;
 
+    my $rssi = $properties->{RSSI};
+    if (defined $rssi) {
+	$known_sensors{$path}->{RSSI_DBM} = $rssi;
+	# we don't bother to check if it actually has changed, just trust Bluez here
+	$has_changed = 1;
+    }
+
     my %service_data = get_device_service_data($properties);
     while (my ($service_data_uuid, $service_data) = each(%service_data)) {
 	my $parser = PARSERS->{$service_data_uuid};
@@ -221,13 +323,11 @@ sub record_device_data {
 	while (my ($key, $value) = each(%new_values)) {
 	    $known_sensors{$path}->{$key} = $value;
 	}
-	$has_changed = 1;
-    }
 
-    my $rssi = $properties->{RSSI};
-    if (defined $rssi) {
-	$known_sensors{$path}->{RSSI_DBM} = $rssi;
-	# we don't bother to check if it actually has changed, just trust Bluez here
+	# only write on sensor updates
+	# TODO: write on both RSSI and sensor updates instead?
+	store_in_rrd($known_sensors{$path});
+
 	$has_changed = 1;
     }
 
@@ -252,7 +352,7 @@ sub adapter_added {
     my ($path) = @_;
     
     log_info "found Adapter $path:";
-    
+
     my $object = $service->get_object($path);
     my $properties = $object->as_interface('org.freedesktop.DBus.Properties');
     $properties->Set(BLUEZ_ADAPTER, 'Powered', dbus_boolean(1));
