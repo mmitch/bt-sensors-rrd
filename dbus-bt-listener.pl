@@ -50,6 +50,8 @@ sub log_dumper {
 ################################################################################
 # DBus helpers
 
+use constant DBUS_PROPERTIES_IF => 'org.freedesktop.DBus.Properties';
+
 my $bus = Net::DBus->system;
 my $service = $bus->get_service("org.bluez");
 
@@ -58,6 +60,7 @@ sub register_signal {
     my $signal_id = $dbus_object->connect_to_signal($signal_name, $coderef);
     log_info "  registered signal $signal_name#$signal_id";
     return sub {
+	log_info "  trying to unregister signal $signal_name#$signal_id";
 	$dbus_object->disconnect_from_signal($signal_name, $signal_id);
 	log_info "  unregistered signal $signal_name#$signal_id";
     }
@@ -65,6 +68,12 @@ sub register_signal {
 
 sub unregister_signals {
     $_->() foreach reverse @_;
+}
+
+sub dbus_get_properties_if {
+    my ($path) = @_;
+    my $object = $service->get_object($path);
+    return $object->as_interface(DBUS_PROPERTIES_IF);
 }
 
 
@@ -267,9 +276,7 @@ sub device_added {
 
     record_device_data($path, $properties);
     
-    my $object = $service->get_object($path);
-    my $properties_if = $object->as_interface('org.freedesktop.DBus.Properties');
-
+    my $properties_if = dbus_get_properties_if($path);
     push @{$known_devices{$path}->{SIGNALS}},
 	register_signal(
 	    $properties_if,
@@ -348,17 +355,18 @@ sub device_properties_changed {
 # DBus interface for Adapters
 use constant BLUEZ_ADAPTER => 'org.bluez.Adapter1';
 
-sub adapter_added {
+sub adapter_set_to_power {
     my ($path) = @_;
-    
-    log_info "found Adapter $path:";
+
+    my $properties_if = dbus_get_properties_if($path);
+    $properties_if->Set(BLUEZ_ADAPTER, 'Powered', dbus_boolean(1));
+    log_info "  set to power";
+}
+
+sub adapter_start_le_discovery {
+    my ($path) = @_;
 
     my $object = $service->get_object($path);
-    my $properties = $object->as_interface('org.freedesktop.DBus.Properties');
-    $properties->Set(BLUEZ_ADAPTER, 'Powered', dbus_boolean(1));
-    log_info "  set to power";
-
-    # start BLE discovery
     my $adapter = $object->as_interface(BLUEZ_ADAPTER);
     $adapter->SetDiscoveryFilter({
 	'Transport' => 'le',
@@ -370,10 +378,55 @@ sub adapter_added {
     log_info "  discovery started";
 }
 
+sub has_changed_to_off {
+    my ($changed, $property) = @_;
+    # false if missing (undefined) or truthy value
+    # true  if set and falsy value
+    return ! ($changed->{$property} // 1);
+}
+
+sub adapter_properties_changed {
+    my ($path, $changed) = @_;
+    use Data::Dumper;
+    print "adapter $path property change:\n" . Dumper($changed) . "\n";
+    if (has_changed_to_off($changed, 'Powered')) {
+	log_info("Adapter $path has lost power");
+	# FIXME: setting power this will crash if the adapter has been removed
+	adapter_set_to_power($path);
+    }
+    if (has_changed_to_off($changed, 'Discovering')) {
+	log_info("Adapter $path stopped discovering");
+	# FIXME: discovering will crash if the adapter has been removed
+	adapter_start_le_discovery($path);
+    }
+}
+
+my %known_adapters;
+sub adapter_added {
+    my ($path, $properties) = @_;
+
+    log_info "found Adapter $path:";
+
+    my $properties_if = dbus_get_properties_if($path);
+    push @{$known_adapters{$path}->{SIGNALS}},
+	register_signal(
+	    $properties_if,
+	    'PropertiesChanged',
+	    sub {
+		my ($interface, $changed, $invalidated) = @_;
+		adapter_properties_changed($path, $changed);
+	    });
+
+    # act on current state and init adapter if needed
+    adapter_properties_changed($path, $properties);
+}
+
 sub adapter_removed {
     my ($path) = @_;
     
     log_info "removed Adapter $path";
+    unregister_signals(@{$known_devices{$path}->{SIGNALS}});
+    delete $known_devices{$path};
 }
 
 
@@ -385,7 +438,7 @@ sub interfaces_added {
 
     while (my ($interface, $properties) = each(%{$interfaces})) {
 	if ($interface eq BLUEZ_ADAPTER) {
-	    adapter_added($path);
+	    adapter_added($path, $properties);
 	}
 	elsif ($interface eq BLUEZ_DEVICE) {
 	    device_added($path, $properties);
