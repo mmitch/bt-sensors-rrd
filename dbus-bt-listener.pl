@@ -101,7 +101,7 @@ use constant RRD_DSS_CONFIG => [
     {
 	NAME => 'batt_pc',
 	MIN => 0,
-	MAX => 100,
+	MAX => 200, # battery level goes > 100% sometimes O_o
     },
     {
 	NAME => 'rssi',
