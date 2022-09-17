@@ -18,6 +18,9 @@ use constant {
 ################################################################################
 # logging
 
+# unbuffer stdout
+$|++;
+
 sub log_with_timestamp {
     my ($sec,$min,$hour,$mday,$mon,$year) = localtime(time);
     printf "%04d-%02d-%02d %02d:%02d:%02d | %s\n",
